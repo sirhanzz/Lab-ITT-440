@@ -1,0 +1,142 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <signal.h>
+#include <time.h>
+#include <sys/wait.h>
+
+#define CHILDREN 3
+
+int pipes[CHILDREN][2];   // global so the Ctrl+C handler can close the pipes
+
+void interrupt_handler(int sig)
+{
+    (void)sig;
+    const char msg1[] =
+        "\n[PARENT] Interrupt detected (Ctrl+C)! "
+        "Shutting down children and exiting...\n";
+    const char msg2[] =
+        "[PARENT] All children terminated. Program ended (by interrupt).\n";
+
+    write(STDOUT_FILENO, msg1, sizeof(msg1) - 1);
+
+    // Close all write ends so every child sees end-of-file and exits
+    for (int i = 0; i < CHILDREN; i++)
+        close(pipes[i][1]);
+
+    // Wait for the children so none is left running
+    while (wait(NULL) > 0)
+        ;
+
+    write(STDOUT_FILENO, msg2, sizeof(msg2) - 1);
+    _exit(0);
+}
+
+int main()
+{
+    pid_t pid;
+    char message[100];
+
+    // Create pipes
+    for (int i = 0; i < CHILDREN; i++)
+    {
+        if (pipe(pipes[i]) == -1)
+        {
+            perror("Pipe creation failed");
+            exit(1);
+        }
+    }
+
+    // Create child processes
+    for (int i = 0; i < CHILDREN; i++)
+    {
+        pid = fork();
+
+        if (pid < 0)
+        {
+            perror("Fork failed");
+            exit(1);
+        }
+
+        if (pid == 0)
+        {
+            // Child process ignores Ctrl+C
+            signal(SIGINT, SIG_IGN);
+
+            // Close every write end (the child only reads), and the
+            // read ends of the other children's pipes
+            for (int j = 0; j < CHILDREN; j++)
+            {
+                close(pipes[j][1]);
+                if (j != i)
+                    close(pipes[j][0]);
+            }
+
+            // Read the pipe one line at a time
+            FILE *in = fdopen(pipes[i][0], "r");
+            char buffer[100];
+
+            while (fgets(buffer, sizeof(buffer), in) != NULL)
+            {
+                buffer[strcspn(buffer, "\n")] = '\0';
+                printf("  [CHILD %d | PID %d] received: \"%s\"\n",
+                       i + 1, getpid(), buffer);
+                fflush(stdout);
+            }
+
+            printf("  [CHILD %d | PID %d] pipe closed, exiting.\n",
+                   i + 1, getpid());
+            fclose(in);
+            exit(0);
+        }
+    }
+
+    // Parent handles Ctrl+C
+    signal(SIGINT, interrupt_handler);
+
+    // Parent only writes, so close all read ends
+    for (int i = 0; i < CHILDREN; i++)
+        close(pipes[i][0]);
+
+    printf("[PARENT | PID %d] Created %d child process(es).\n",
+           getpid(), CHILDREN);
+    printf("Type a message and press Enter to send it to all children.\n");
+    printf("Type \"exit\" to exit  or press Ctrl+C to interrupt.\n\n");
+
+    // Keep asking for messages until the user types exit
+    while (1)
+    {
+        printf("Enter message: ");
+        fflush(stdout);
+
+        if (fgets(message, sizeof(message), stdin) == NULL)
+            break;                              // Ctrl+D
+
+        if (strcmp(message, "exit\n") == 0)
+            break;                              // user typed exit
+
+        if (message[0] == '\n')
+            continue;                           // ignore empty input
+
+        // Send message to all children
+        for (int i = 0; i < CHILDREN; i++)
+            write(pipes[i][1], message, strlen(message));
+
+        // Short pause so the children can print before the next prompt
+        struct timespec ts = {0, 100000000L};   // 100 ms
+        nanosleep(&ts, NULL);
+    }
+
+    // Close write ends so every child sees end-of-file and exits
+    for (int i = 0; i < CHILDREN; i++)
+        close(pipes[i][1]);
+
+    // Wait for all children to finish
+    for (int i = 0; i < CHILDREN; i++)
+        wait(NULL);
+
+    printf("[PARENT | PID %d] All children terminated. Program ended.\n",
+           getpid());
+    return 0;
+}
